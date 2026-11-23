@@ -6,7 +6,8 @@ mod d3d;
 
 use core::ffi::c_void;
 use d3d::{Gpu, Guid};
-use tombox_xshader::hlsl::translate;
+use tombox_xshader::hlsl::{passthrough_hull, translate, Partitioning};
+use tombox_xshader::tess_abi::{TfLayout, TB_TESS_CB_DWORDS, TB_TESS_CB_REGISTER, TB_TESS_GFX6_CONTROL_WORD, TB_TESS_SPACE, TB_TESS_TF_REGISTER};
 use tombox_xshader::meta::{GsInfo, SigElement, TessInfo};
 use tombox_xshader::{dxc, rdna2, ShaderExtract, Stage};
 
@@ -181,11 +182,23 @@ unsafe fn gpu_on(device: *mut c_void) -> Gpu {
     Gpu { device, queue, alloc, list, fence, value: 0, info: core::ptr::null_mut(), open: false }
 }
 
-unsafe fn empty_root_signature(gpu: &Gpu) -> *mut c_void {
+unsafe fn tess_root_signature(gpu: &Gpu) -> *mut c_void {
     let d3d12 = LoadLibraryA(b"d3d12.dll\0".as_ptr());
     let ser: unsafe extern "system" fn(*const u8, u32, *mut *mut c_void, *mut *mut c_void) -> i32 =
         core::mem::transmute(GetProcAddress(d3d12, b"D3D12SerializeRootSignature\0".as_ptr()));
-    let desc = [0u8; 40];
+    let mut params = [0u8; 96];
+    let put = |p: &mut [u8; 96], o: usize, v: u32| p[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    put(&mut params, 0, 3);
+    put(&mut params, 8, TB_TESS_TF_REGISTER);
+    put(&mut params, 12, TB_TESS_SPACE);
+    put(&mut params, 32, 1);
+    put(&mut params, 40, TB_TESS_CB_REGISTER);
+    put(&mut params, 44, TB_TESS_SPACE);
+    put(&mut params, 48, TB_TESS_CB_DWORDS);
+    put(&mut params, 64, 4);
+    let mut desc = [0u8; 40];
+    desc[0..4].copy_from_slice(&3u32.to_le_bytes());
+    desc[8..16].copy_from_slice(&(params.as_ptr() as u64).to_le_bytes());
     let mut blob: *mut c_void = core::ptr::null_mut();
     let mut err: *mut c_void = core::ptr::null_mut();
     assert!(ser(desc.as_ptr(), 1, &mut blob, &mut err) >= 0, "D3D12SerializeRootSignature");
@@ -196,18 +209,40 @@ unsafe fn empty_root_signature(gpu: &Gpu) -> *mut c_void {
     rs
 }
 
+struct Pipe<'a> {
+    vs: &'a [u8],
+    hs: &'a [u8],
+    ds: &'a [u8],
+    patches: u32,
+    control_points: u32,
+    ring: Vec<u32>,
+    consts: [u32; 2],
+}
+
+struct Rendered {
+    pixels: Vec<[u32; 4]>,
+    log: Vec<u32>,
+}
+
+const LOG_DWORDS: usize = 256;
+const UAV_STATE: u32 = 8;
+
 unsafe fn render_patches(ds_code: &[u8], patches: u32) -> Result<Vec<[u32; 4]>, String> {
     let vs = dxc::compile(VS, "vs_6_2")?;
     let hs = dxc::compile(HS, "hs_6_2")?;
+    render(&Pipe { vs: &vs, hs: &hs, ds: ds_code, patches, control_points: 1, ring: vec![0], consts: [0, 0] }).map(|r| r.pixels)
+}
+
+unsafe fn render(p: &Pipe) -> Result<Rendered, String> {
     let ps = dxc::compile(PS, "ps_6_2")?;
     let _warp = WARP_RENDER.lock().unwrap_or_else(|e| e.into_inner());
     let mut gpu = gpu_on(warp_device());
-    let rs = empty_root_signature(&gpu);
+    let rs = tess_root_signature(&gpu);
     let mut d = vec![0u8; 656];
     let put32 = |d: &mut Vec<u8>, o: usize, v: u32| d[o..o + 4].copy_from_slice(&v.to_le_bytes());
     let put64 = |d: &mut Vec<u8>, o: usize, v: u64| d[o..o + 8].copy_from_slice(&v.to_le_bytes());
     put64(&mut d, 0, rs as u64);
-    for (o, code) in [(8usize, &vs[..]), (24, &ps[..]), (40, ds_code), (56, &hs[..])] {
+    for (o, code) in [(8usize, p.vs), (24, &ps[..]), (40, p.ds), (56, p.hs)] {
         put64(&mut d, o, code.as_ptr() as u64);
         put64(&mut d, o + 8, code.len() as u64);
     }
@@ -254,22 +289,36 @@ unsafe fn render_patches(ds_code: &[u8], patches: u32) -> Result<Vec<[u32; 4]>, 
     let rt = gpu.committed(&td, d3d::default_heap(), 4)?;
     let pitch = W * 16;
     let rb = gpu.buffer((pitch * H) as u64, 3, d3d::COPY_DEST, false)?;
+    let ring_bytes: Vec<u8> = p.ring.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let ring = gpu.buffer(ring_bytes.len() as u64, 2, d3d::GENERIC_READ, false)?;
+    assert!(Gpu::map_write(ring, &ring_bytes), "map ring");
+    let log_bytes = (LOG_DWORDS * 4) as u64;
+    let zeros = gpu.buffer(log_bytes, 2, d3d::GENERIC_READ, false)?;
+    assert!(Gpu::map_write(zeros, &vec![0u8; LOG_DWORDS * 4]), "map zeros");
+    let log = gpu.buffer(log_bytes, 1, d3d::COPY_DEST, true)?;
+    let log_rb = gpu.buffer(log_bytes, 3, d3d::COPY_DEST, false)?;
     let (rtv_heap, rtv, _, _) = gpu.heap(2, 1, false)?;
     vcall!(gpu.device, 20, fn(*mut c_void, *const c_void, usize) -> (), rt, core::ptr::null(), rtv);
     gpu.begin();
     let l = gpu.list;
+    vcall!(l, 15, fn(*mut c_void, u64, *mut c_void, u64, u64) -> (), log, 0, zeros, 0, log_bytes);
+    gpu.barrier(log, d3d::COPY_DEST, UAV_STATE);
     let clear = [CLEAR as f32; 4];
     vcall!(l, 48, fn(usize, *const f32, u32, *const c_void) -> (), rtv, clear.as_ptr(), 0, core::ptr::null());
     vcall!(l, 46, fn(u32, *const usize, i32, *const usize) -> (), 1, &rtv, 0, core::ptr::null());
     vcall!(l, 30, fn(*mut c_void) -> (), rs);
+    vcall!(l, 40, fn(u32, u64) -> (), 0, Gpu::gpu_va(ring));
+    vcall!(l, 36, fn(u32, u32, *const u32, u32) -> (), 1, 2, p.consts.as_ptr(), 0);
+    vcall!(l, 42, fn(u32, u64) -> (), 2, Gpu::gpu_va(log));
     vcall!(l, 25, fn(*mut c_void) -> (), pso);
     let vp = [0f32, 0., W as f32, H as f32, 0., 1.];
     vcall!(l, 21, fn(u32, *const f32) -> (), 1, vp.as_ptr());
     let sc = [0i32, 0, W as i32, H as i32];
     vcall!(l, 22, fn(u32, *const i32) -> (), 1, sc.as_ptr());
-    vcall!(l, 20, fn(u32) -> (), 33);
-    vcall!(l, 12, fn(u32, u32, u32, u32) -> (), patches, 1, 0, 0);
+    vcall!(l, 20, fn(u32) -> (), 32 + p.control_points);
+    vcall!(l, 12, fn(u32, u32, u32, u32) -> (), p.patches * p.control_points, 1, 0, 0);
     gpu.barrier(rt, 4, d3d::COPY_SOURCE);
+    gpu.barrier(log, UAV_STATE, d3d::COPY_SOURCE);
     let mut dst = [0u8; 48];
     dst[0..8].copy_from_slice(&(rb as u64).to_le_bytes());
     dst[8..12].copy_from_slice(&1u32.to_le_bytes());
@@ -281,14 +330,18 @@ unsafe fn render_patches(ds_code: &[u8], patches: u32) -> Result<Vec<[u32; 4]>, 
     let mut src = [0u8; 48];
     src[0..8].copy_from_slice(&(rt as u64).to_le_bytes());
     vcall!(l, 16, fn(*const u8, u32, u32, u32, *const u8, *const c_void) -> (), dst.as_ptr(), 0, 0, 0, src.as_ptr(), core::ptr::null());
+    vcall!(l, 15, fn(*mut c_void, u64, *mut c_void, u64, u64) -> (), log_rb, 0, log, 0, log_bytes);
     let submitted = gpu.submit();
     let bytes = Gpu::map_read(rb, pitch * H);
-    for obj in [pso, rt, rb, rtv_heap, rs, gpu.list, gpu.alloc, gpu.fence, gpu.queue, gpu.device] {
+    let log_read = Gpu::map_read(log_rb, LOG_DWORDS * 4);
+    for obj in [pso, rt, rb, ring, zeros, log, log_rb, rtv_heap, rs, gpu.list, gpu.alloc, gpu.fence, gpu.queue, gpu.device] {
         d3d::release(obj);
     }
     submitted?;
     let b = bytes.ok_or("map readback")?;
-    Ok(b.chunks_exact(16).map(|px| core::array::from_fn(|k| u32::from_le_bytes(px[k * 4..k * 4 + 4].try_into().unwrap()))).collect())
+    let pixels = b.chunks_exact(16).map(|px| core::array::from_fn(|k| u32::from_le_bytes(px[k * 4..k * 4 + 4].try_into().unwrap()))).collect();
+    let log = log_read.ok_or("map log readback")?.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+    Ok(Rendered { pixels, log })
 }
 
 #[test]
@@ -374,4 +427,151 @@ fn gpu_translated_domain_shader_matches_native_hlsl_on_a_tessellated_quad() {
     }
     let distinct_u: std::collections::BTreeSet<u32> = got.iter().map(|p| p[0]).collect();
     assert!(distinct_u.len() >= 4, "tessellation produced too few distinct u values: {distinct_u:?}");
+}
+
+fn hull_info(domain: u32, output_primitive: u32, output_control_points: u32) -> TessInfo {
+    TessInfo { stage: 3, input_control_points: 1, output_control_points, domain, output_primitive, output_position: false, patch_const_vectors: 0 }
+}
+
+fn quad_ring(layout: TfLayout, tf_offset_dwords: usize, slots: &[f32]) -> Vec<u32> {
+    let mut ring = vec![0u32; tf_offset_dwords];
+    if layout == TfLayout::Gfx6To8 {
+        ring.push(TB_TESS_GFX6_CONTROL_WORD);
+    }
+    for &f in slots {
+        ring.extend([f.to_bits(); 6]);
+    }
+    ring
+}
+
+unsafe fn render_quad_with_passthrough(layout: TfLayout, ring: Vec<u32>, consts: [u32; 2]) -> Rendered {
+    let ds_ex = console_quad_ds();
+    let t = translate(&ds_ex).unwrap_or_else(|e| panic!("{e}"));
+    let ds_code = dxc::compile(&t.hlsl, &dxc::profile_for(t.profile)).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    let pt = passthrough_hull(&hull_info(3, 3, 1), &ds_ex, Partitioning::Integer, layout).unwrap_or_else(|e| panic!("{e}"));
+    let vs = dxc::compile(&pt.vs, "vs_6_2").unwrap_or_else(|e| panic!("{e}\n{}", pt.vs));
+    let hs = dxc::compile(&pt.hs, "hs_6_2").unwrap_or_else(|e| panic!("{e}\n{}", pt.hs));
+    render(&Pipe { vs: &vs, hs: &hs, ds: &ds_code, patches: 2, control_points: 1, ring, consts }).unwrap_or_else(|e| panic!("{e}\n{}", pt.hs))
+}
+
+fn on_grid(bits: u32, n: u32) -> bool {
+    (0..=n).any(|k| (k as f32 / n as f32).to_bits() == bits)
+}
+
+#[test]
+fn passthrough_hull_reads_the_hardware_factor_layout() {
+    let pt = passthrough_hull(&hull_info(3, 3, 1), &console_quad_ds(), Partitioning::FractionalOdd, TfLayout::Gfx6To8).unwrap_or_else(|e| panic!("{e}"));
+    for needle in [
+        "ByteAddressBuffer tb_tf : register(t0, space4000006);",
+        "cbuffer TbTess : register(b0, space4000006) { uint tb_tf_offset; uint tb_patch_offset; };",
+        "uint b = tb_tf_offset + 4u + (tb_patch_offset + pid) * 24u;",
+        "o.tb_tf0[3] = asfloat(tb_tf.Load(b + 12u));",
+        "o.tb_tf1[1] = asfloat(tb_tf.Load(b + 20u));",
+        "[partitioning(\"fractional_odd\")]",
+        "[outputtopology(\"triangle_cw\")]",
+        "[outputcontrolpoints(1)]",
+        "float4 i0 : CPOS0;",
+    ] {
+        assert!(pt.hs.contains(needle), "missing {needle:?}\n{}", pt.hs);
+    }
+    let tri = ds(&console_ds(), Some(tess_info(4, 3, 2)), vec![sig("CPOS", 0, 0, 3, 0, 0xf)], tri_patch_sig(), vec![sig("SV_Position", 0, 1, 3, 0, 0xf)]);
+    let pt = passthrough_hull(&hull_info(2, 4, 3), &tri, Partitioning::Integer, TfLayout::Gfx9Plus).unwrap_or_else(|e| panic!("{e}"));
+    for needle in ["uint b = tb_tf_offset + 0u + (tb_patch_offset + pid) * 16u;", "o.tb_tf1 = asfloat(tb_tf.Load(b + 12u));", "float4 p4 : PATCHDATA0;", "[outputtopology(\"triangle_ccw\")]"] {
+        assert!(pt.hs.contains(needle), "missing {needle:?}\n{}", pt.hs);
+    }
+}
+
+#[test]
+fn passthrough_hulls_compile_for_every_domain_and_partitioning() {
+    let outs = || vec![sig("SV_Position", 0, 1, 3, 0, 0xf)];
+    let cases = [
+        (ds(&console_ds(), Some(tess_info(4, 1, 1)), vec![], vec![], outs()), hull_info(1, 2, 1)),
+        (ds(&console_ds(), Some(tess_info(4, 3, 2)), vec![sig("CPOS", 0, 0, 3, 0, 0xf)], tri_patch_sig(), outs()), hull_info(2, 3, 3)),
+        (console_quad_ds(), hull_info(3, 1, 1)),
+    ];
+    for (dse, hi) in &cases {
+        for part in [Partitioning::Integer, Partitioning::Pow2, Partitioning::FractionalOdd, Partitioning::FractionalEven] {
+            for layout in [TfLayout::Gfx6To8, TfLayout::Gfx9Plus] {
+                let pt = passthrough_hull(hi, dse, part, layout).unwrap_or_else(|e| panic!("{e}"));
+                dxc::compile(&pt.hs, "hs_6_2").unwrap_or_else(|e| panic!("{e}\n{}", pt.hs));
+            }
+        }
+    }
+    dxc::compile(tombox_xshader::hlsl::PASSTHROUGH_VS, "vs_6_2").unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn passthrough_hull_refusals() {
+    let quad = console_quad_ds();
+    let refuse = |hi: TessInfo, d: &ShaderExtract| passthrough_hull(&hi, d, Partitioning::Integer, TfLayout::Gfx9Plus).err().unwrap_or_default();
+    assert_eq!(refuse(tess_info(4, 1, 3), &quad), "pass-through hull needs hull-shader PSV0 tessellator info");
+    assert_eq!(refuse(hull_info(2, 3, 1), &quad), "hull domain 2 differs from domain shader domain 3");
+    assert_eq!(refuse(hull_info(3, 3, 4), &quad), "hull outputs 4 control points, domain shader reads 1");
+    assert_eq!(refuse(hull_info(3, 2, 1), &quad), "tessellator output primitive 2 is not valid for domain 3");
+    let lines = ds(&console_ds(), Some(tess_info(4, 1, 1)), vec![], vec![], vec![]);
+    assert_eq!(refuse(hull_info(1, 3, 1), &lines), "tessellator output primitive 3 is not valid for domain 1");
+    let mut no_info = quad.clone();
+    no_info.gs_info = None;
+    assert_eq!(refuse(hull_info(3, 3, 1), &no_info), "Domain shader without PSV0 tessellator info");
+    let mut vertex = quad.clone();
+    vertex.stage = Stage::Vertex;
+    assert_eq!(refuse(hull_info(3, 3, 1), &vertex), "pass-through hull feeds a domain shader, not Vertex");
+}
+
+#[test]
+fn gpu_passthrough_hull_takes_each_patch_factors_from_the_ring() {
+    let r = unsafe { render_quad_with_passthrough(TfLayout::Gfx9Plus, quad_ring(TfLayout::Gfx9Plus, 0, &[2.0, 4.0]), [0, 0]) };
+    let mut off_half_grid = 0;
+    for (k, px) in r.pixels.iter().enumerate() {
+        let (x, y) = (k % W, k / W);
+        assert_ne!(px[3], CLEAR, "pixel ({x}, {y}) not covered: {px:?}");
+        assert_eq!(px[2] + 1, px[3], "pixel ({x}, {y}): DS patch id differs from SV_PrimitiveID: {px:?}");
+        let n = if x < W / 2 { 2 } else { 4 };
+        assert_eq!(px[2], (n == 4) as u32, "pixel ({x}, {y}) in the wrong patch: {px:?}");
+        assert!(on_grid(px[0], n) && on_grid(px[1], n), "pixel ({x}, {y}) off the factor-{n} grid: {px:?}");
+        off_half_grid += (n == 4 && !(on_grid(px[0], 2) && on_grid(px[1], 2))) as u32;
+    }
+    assert!(off_half_grid > 0, "patch 1 shows no factor-4 vertices, so its factors were not read");
+}
+
+#[test]
+fn gpu_passthrough_hull_honours_the_gfx6_control_word_and_both_offsets() {
+    let base = unsafe { render_quad_with_passthrough(TfLayout::Gfx9Plus, quad_ring(TfLayout::Gfx9Plus, 0, &[2.0, 4.0]), [0, 0]) }.pixels;
+    let gcn_ring = quad_ring(TfLayout::Gfx6To8, 5, &[16.0, 2.0, 4.0]);
+    let gcn = unsafe { render_quad_with_passthrough(TfLayout::Gfx6To8, gcn_ring.clone(), [20, 1]) }.pixels;
+    assert_eq!(gcn, base, "control word at the TF offset, factors 4 bytes later, patch offset 1");
+    let misread = unsafe { render_quad_with_passthrough(TfLayout::Gfx9Plus, gcn_ring, [20, 1]) }.pixels;
+    assert_ne!(misread, base, "reading a GFX6-8 ring without the control-word shift must not match");
+}
+
+const DS_ISOLINE_LOG: &str = "RWByteAddressBuffer tb_log : register(u0);
+struct SCp { uint tb_pad : TBPAD; };
+struct SPatch { float tb_tf0[2] : SV_TessFactor; };
+struct O { float4 p : SV_Position; uint3 t : TEXCOORD0; };
+[domain(\"isoline\")]
+O main(float2 loc : SV_DomainLocation, uint pid : SV_PrimitiveID, const OutputPatch<SCp, 1> cp, SPatch pc) {
+    uint k;
+    tb_log.InterlockedAdd(0, 1u, k);
+    if (k < 120u) tb_log.Store2(8u + 8u * k, uint2(asuint(loc.x), asuint(loc.y)));
+    O o;
+    o.p = float4(loc.x, loc.y, 0.0, 1.0);
+    o.t = uint3(0u, 0u, pid);
+    return o;
+}";
+
+#[test]
+fn gpu_isoline_ring_dword0_is_line_detail_and_dword1_is_line_density() {
+    let lines = ds(&console_ds(), Some(tess_info(4, 1, 1)), vec![], vec![sig("SV_TessFactor", 0, 15, 3, 0, 1), sig("SV_TessFactor", 1, 16, 3, 1, 1)], vec![sig("SV_Position", 0, 1, 3, 0, 0xf)]);
+    let pt = passthrough_hull(&hull_info(1, 2, 1), &lines, Partitioning::Integer, TfLayout::Gfx9Plus).unwrap_or_else(|e| panic!("{e}"));
+    let vs = dxc::compile(&pt.vs, "vs_6_2").unwrap_or_else(|e| panic!("{e}"));
+    let hs = dxc::compile(&pt.hs, "hs_6_2").unwrap_or_else(|e| panic!("{e}\n{}", pt.hs));
+    let dsc = dxc::compile(DS_ISOLINE_LOG, "ds_6_2").unwrap_or_else(|e| panic!("{e}"));
+    let r = unsafe { render(&Pipe { vs: &vs, hs: &hs, ds: &dsc, patches: 1, control_points: 1, ring: vec![3.0f32.to_bits(), 2.0f32.to_bits()], consts: [0, 0] }) }.unwrap_or_else(|e| panic!("{e}\n{}", pt.hs));
+    let n = (r.log[0] as usize).min(120);
+    assert!(n > 0, "the domain shader never ran");
+    let points: Vec<(u32, u32)> = (0..n).map(|k| (r.log[2 + 2 * k], r.log[3 + 2 * k])).collect();
+    let us: std::collections::BTreeSet<u32> = points.iter().map(|p| p.0).collect();
+    let vs_: std::collections::BTreeSet<u32> = points.iter().map(|p| p.1).collect();
+    assert_eq!(vs_, [0.0f32, 0.5].iter().map(|f| f.to_bits()).collect(), "line density 2 gives lines at v = 0 and 0.5: {points:?}");
+    assert_eq!(us.len(), 4, "line detail 3 gives 4 points per line: {points:?}");
 }

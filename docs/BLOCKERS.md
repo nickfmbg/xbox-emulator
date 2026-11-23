@@ -1250,3 +1250,13 @@ Headless runs straight into each title's test scene, on the staged release of 11
 ## rectlist expansion for stream-built PSOs (d3d12_xs) - 2026-11-23, steward from #280
 - OPEN: draws with IA topology RECTLIST (17) on a PSO built from a pipeline state stream are not expanded. rectlist.rs finds no recorded PC description for those PSOs and refuses them, so each rect draws only its first triangle. #280 fixes the PSO side (console topology type 0x13 becomes TRIANGLE in non-mesh streams). The draw side still needs a PC description recorded for stream-built PSOs so the existing expansion can run.
 - Done when: a WARP test draws a rect list through a stream-built PSO and checks that every pixel of the full rect is covered.
+
+## Hull / domain shader stages (tombox-xshader, all titles) - 2026-11-23, tessellation (#294)
+- DONE (#295): PSV0 hull and domain runtime info (control points, domain, output primitive, output-position byte) is parsed into `GsInfo::tess`.
+- DONE (#301): domain shaders translate in their hardware VS-stage form. `v0`/`v1` = `SV_DomainLocation.x/.y`, `v2`/`v3` = `SV_PrimitiveID` (Mesa `declare_tes_input_vgprs`). WARP renders bit-exact against a native HLSL domain shader (tests/tess.rs).
+- DONE: `hlsl::passthrough_hull` generates the PC hull shader and its vertex shader. Its patch-constant function reads the factors of patch `tb_patch_offset + SV_PrimitiveID` from `tb_tf` (t0, space 4000006) at `tb_tf_offset + rel_patch * (outer + inner) * 4`, plus 4 on GFX6-8, where the ring starts with the 0x80000000 control word (Mesa `hs_store_tess_factors_for_tessellator`, `hs_store_dynamic_control_word_gfx6`). WARP tests check per-patch factors, the control word and both offsets, and that isoline ring dword 0 is the line detail and dword 1 the line density.
+- OPEN, hull program: the console HS (merged LS-HS on GFX10) is not translated. The plan in #294 runs it as a compute pass that writes the off-chip ring and `tb_tf`. It needs where the off-chip and TF ring descriptors come from (internal table at s[0:1]?), which no console fixture has shown yet.
+- OPEN, domain shader ring reads: control-point and patch-constant loads from the off-chip ring are refused until the same descriptor question is answered.
+- OPEN, partitioning and max tess factor: not in PSV0 and the DXIL is `NOBC`. `passthrough_hull` takes the partitioning as an argument; d3d12_xs has to source it from the console HS state (VGT_TF_PARAM).
+- OPEN, NGG: domain shaders compiled as ES inside an NGG GS (inputs after the 5 GS VGPRs) are not handled.
+- OPEN, d3d12_xs: no draw path builds a PSO from translated HS/DS yet.

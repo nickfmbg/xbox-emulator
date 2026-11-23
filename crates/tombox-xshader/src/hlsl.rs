@@ -38,6 +38,7 @@ mod user_data;
 mod smem_bounds;
 mod tess;
 pub use smem_bounds::{CBFIT_CBUFFER, CBFIT_RAW};
+pub use tess::{passthrough_hull, Partitioning, PassthroughHull, PASSTHROUGH_VS};
 pub mod infer;
 use mimg_d16::{mimg_data_regs, Lane};
 

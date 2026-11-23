@@ -28,6 +28,7 @@ pub mod gds_abi;
 pub mod global_abi;
 pub mod centroid_abi;
 pub mod user_data_abi;
+pub mod tess_abi;
 pub mod runtime_hlsl;
 pub mod cbv_raw_hlsl;
 #[cfg(windows)]
