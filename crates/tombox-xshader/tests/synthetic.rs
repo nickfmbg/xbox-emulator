@@ -78,6 +78,7 @@ fn external_root_signature_binds_a_stripped_mesh_shader() {
             topology: 2,
             num_threads: [32, 1, 1],
         }),
+        tess: None,
     });
     let Err(error) = translate(&ex) else {
         panic!("translation unexpectedly accepted the missing root descriptor");
@@ -485,6 +486,7 @@ fn amplification_dispatch_uses_the_y_and_z_group_counts() {
             topology: 0,
             num_threads: [32, 1, 1],
         }),
+        tess: None,
     });
     let t = translate(&ex).expect("amplification shader translates");
     assert!(
@@ -502,7 +504,7 @@ fn geometry(prim: u32, topo: u32) -> Result<tombox_xshader::hlsl::Translated, St
         vec![sig("SV_Position", 1, 3, 0, 0xf)],
         None,
     );
-    ex.gs_info = Some(GsInfo { input_primitive: prim, output_topology: topo, max_vertex_count: 1, mesh: None });
+    ex.gs_info = Some(GsInfo { input_primitive: prim, output_topology: topo, max_vertex_count: 1, mesh: None, tess: None });
     translate(&ex)
 }
 

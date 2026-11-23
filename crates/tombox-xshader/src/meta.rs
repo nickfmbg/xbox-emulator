@@ -86,6 +86,42 @@ pub struct GsInfo {
     pub output_topology: u32,
     pub max_vertex_count: u16,
     pub mesh: Option<MeshInfo>,
+    pub tess: Option<TessInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TessInfo {
+    pub stage: u8,
+    pub input_control_points: u32,
+    pub output_control_points: u32,
+    pub domain: u32,
+    pub output_primitive: u32,
+    pub output_position: bool,
+    pub patch_const_vectors: u8,
+}
+
+pub fn parse_psv0_tess(info: &[u8]) -> Option<TessInfo> {
+    let stage = *info.get(24)?;
+    let input_control_points = u32_at(info, 0).ok()?;
+    let patch_const_vectors = *info.get(26)?;
+    let (output_control_points, domain, output_primitive, output_position) = match stage {
+        3 => (u32_at(info, 4).ok()?, u32_at(info, 8).ok()?, u32_at(info, 12).ok()?, false),
+        4 => (0, u32_at(info, 8).ok()?, 0, *info.get(4)? != 0),
+        _ => return None,
+    };
+    let control_points_ok = |n: u32| (1..=32).contains(&n);
+    let valid = control_points_ok(input_control_points)
+        && (1..=3).contains(&domain)
+        && (stage == 4 || (control_points_ok(output_control_points) && (1..=4).contains(&output_primitive)));
+    valid.then_some(TessInfo {
+        stage,
+        input_control_points,
+        output_control_points,
+        domain,
+        output_primitive,
+        output_position,
+        patch_const_vectors,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +205,7 @@ pub fn parse_psv0_gs(body: &[u8]) -> Option<GsInfo> {
         output_topology: u32_at(info, 4).ok()?,
         max_vertex_count: u16::from_le_bytes([*info.get(26)?, *info.get(27)?]),
         mesh: parse_psv0_mesh(info),
+        tess: parse_psv0_tess(info),
     })
 }
 
@@ -432,5 +469,80 @@ mod tests {
         let mut union_only = cs_blob(48, [4, 2, 1]);
         union_only[4..16].copy_from_slice(&[8, 0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0]);
         assert_eq!(parse_psv0_cs_threads(&union_only), Some([4, 2, 1]));
+    }
+
+    fn tess_info_bytes(stage: u8, union: [u32; 4], patch_const_vectors: u8) -> Vec<u8> {
+        let mut info = vec![0u8; 36];
+        for (k, v) in union.iter().enumerate() {
+            info[k * 4..k * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        info[24] = stage;
+        info[26] = patch_const_vectors;
+        info
+    }
+
+    #[test]
+    fn psv0_hull_runtime_info_gives_control_points_domain_and_output_primitive() {
+        let info = tess_info_bytes(3, [3, 4, 2, 3], 2);
+        assert_eq!(
+            parse_psv0_tess(&info),
+            Some(TessInfo {
+                stage: 3,
+                input_control_points: 3,
+                output_control_points: 4,
+                domain: 2,
+                output_primitive: 3,
+                output_position: false,
+                patch_const_vectors: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn psv0_domain_runtime_info_reads_the_position_byte_and_the_aligned_domain() {
+        let info = tess_info_bytes(4, [16, 1, 3, 0xdead_beef], 1);
+        assert_eq!(
+            parse_psv0_tess(&info),
+            Some(TessInfo {
+                stage: 4,
+                input_control_points: 16,
+                output_control_points: 0,
+                domain: 3,
+                output_primitive: 0,
+                output_position: true,
+                patch_const_vectors: 1,
+            })
+        );
+        let mut no_position = tess_info_bytes(4, [16, 0, 3, 0], 1);
+        no_position[5] = 0xff;
+        assert_eq!(parse_psv0_tess(&no_position).map(|t| t.output_position), Some(false));
+    }
+
+    #[test]
+    fn psv0_tess_info_refuses_other_stages_and_out_of_range_fields() {
+        for stage in [0u8, 1, 2, 5, 13, 14] {
+            assert_eq!(parse_psv0_tess(&tess_info_bytes(stage, [3, 3, 2, 3], 0)), None, "stage {stage}");
+        }
+        for union in [[0, 3, 2, 3], [33, 3, 2, 3], [3, 0, 2, 3], [3, 33, 2, 3], [3, 3, 0, 3], [3, 3, 4, 3], [3, 3, 2, 0], [3, 3, 2, 5]] {
+            assert_eq!(parse_psv0_tess(&tess_info_bytes(3, union, 0)), None, "hull {union:?}");
+        }
+        for union in [[0, 1, 2, 0], [33, 1, 2, 0], [3, 1, 0, 0], [3, 1, 4, 0]] {
+            assert_eq!(parse_psv0_tess(&tess_info_bytes(4, union, 0)), None, "domain {union:?}");
+        }
+        assert_eq!(parse_psv0_tess(&tess_info_bytes(3, [3, 3, 2, 3], 0)[..26]), None);
+    }
+
+    #[test]
+    fn psv0_gs_info_carries_the_tess_info_of_a_hull_shader() {
+        let info = tess_info_bytes(3, [32, 32, 3, 4], 0);
+        let mut body = (info.len() as u32).to_le_bytes().to_vec();
+        body.extend_from_slice(&info);
+        let gs = parse_psv0_gs(&body).expect("PSV0 runtime info");
+        assert_eq!(gs.mesh, None);
+        assert_eq!(gs.tess.map(|t| (t.input_control_points, t.output_control_points, t.domain, t.output_primitive)), Some((32, 32, 3, 4)));
+        let vertex = tess_info_bytes(1, [0; 4], 0);
+        let mut body = (vertex.len() as u32).to_le_bytes().to_vec();
+        body.extend_from_slice(&vertex);
+        assert_eq!(parse_psv0_gs(&body).and_then(|g| g.tess), None);
     }
 }
